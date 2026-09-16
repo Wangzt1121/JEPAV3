@@ -235,8 +235,15 @@ python build_frontier_bank.py \
   --history-size 3 \
   --frameskip 5 \
   --knn-k 10 \
+  --batch-size 24 \
+  --num-workers 0 \
+  --devices 0,1,2 \
   --device cuda
 ```
+
+`--devices 0,1,2` runs the frozen LeWM encoder with one replica on each of the
+three visible GPUs. The total batch size is 24, so each GPU encodes eight clips
+per step.
 
 Old Bank artifacts are intentionally rejected by `explore.py`. Rebuild the Bank
 after changing the sampler or calibration logic.

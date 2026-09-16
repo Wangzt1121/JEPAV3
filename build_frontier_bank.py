@@ -14,6 +14,27 @@ from frontier.score import quantiles
 from utils import ZScoreNormalizer, get_img_preprocessor
 
 
+class EncodeWrapper(torch.nn.Module):
+    """Expose LeWM encoding through forward for torch DataParallel."""
+
+    def __init__(self, lewm):
+        super().__init__()
+        self.lewm = lewm
+        dtype = next(lewm.encoder.parameters()).dtype
+        self.register_buffer("dtype_anchor", torch.empty(0, dtype=dtype), persistent=False)
+
+    def forward(self, pixels, action):
+        pixels = pixels.to(self.dtype_anchor.dtype)
+        batch, steps = pixels.shape[:2]
+        output = self.lewm.encoder(
+            pixels.reshape(batch * steps, *pixels.shape[2:]),
+            interpolate_pos_encoding=True,
+        )
+        embedding = self.lewm.projector(output.last_hidden_state[:, 0])
+        embedding = embedding.reshape(batch, steps, -1)
+        return embedding, self.lewm.action_encoder(action)
+
+
 def fit_action_stats(name):
     dataset = swm.data.load_dataset(name, keys_to_load=["action"])
     action = torch.as_tensor(np.asarray(dataset.get_col_data("action"))).float()
@@ -113,9 +134,9 @@ def move_batch(batch, device):
     return {"pixels": batch["pixels"].to(device), "action": action.to(device)}
 
 
-def encode_last_transition(lewm, batch, device):
+def encode_last_transition(encoder, batch, device):
     batch = move_batch(batch, device)
-    return lewm.encode({key: value[:, -2:] for key, value in batch.items()})
+    return encoder(batch["pixels"][:, -2:], batch["action"][:, -2:])
 
 
 @torch.no_grad()
@@ -141,13 +162,37 @@ def main():
     parser.add_argument("--calibration-size", type=int, default=4096)
     parser.add_argument("--knn-k", type=int, default=10)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--devices",
+        help="comma-separated CUDA device indices for encoding, for example 0,1,2",
+    )
     args = parser.parse_args()
     if min(args.history_size, args.frameskip, args.max_size, args.calibration_size) < 1:
         parser.error("history-size, frameskip, max-size and calibration-size must be positive")
 
-    device = torch.device(args.device)
+    device_ids = (
+        [int(value) for value in args.devices.split(",")]
+        if args.devices else []
+    )
+    if len(set(device_ids)) != len(device_ids):
+        parser.error("devices must not contain duplicates")
+    if device_ids:
+        if not torch.cuda.is_available():
+            parser.error("devices requires CUDA")
+        if min(device_ids) < 0 or max(device_ids) >= torch.cuda.device_count():
+            parser.error(f"devices must be within [0, {torch.cuda.device_count() - 1}]")
+        device = torch.device(f"cuda:{device_ids[0]}")
+    else:
+        device = torch.device(args.device)
     lewm = swm.wm.utils.load_pretrained(args.checkpoint).to(device).eval()
     lewm.requires_grad_(False)
+    encoder = EncodeWrapper(lewm).to(device).eval()
+    if len(device_ids) > 1:
+        encoder = torch.nn.DataParallel(encoder, device_ids=device_ids)
+    print(
+        f"encoding_devices={device_ids or [str(device)]} "
+        f"data_parallel={isinstance(encoder, torch.nn.DataParallel)}"
+    )
     stats_dataset = args.stats_dataset or args.dataset
     action_stats = fit_action_stats(stats_dataset)
     dataset = load_dataset(args.dataset, args.history_size, args.frameskip,
@@ -176,8 +221,7 @@ def main():
     for batch_index, raw in enumerate(DataLoader(Subset(dataset, train_indices), **loader_kwargs)):
         if args.max_batches and batch_index >= args.max_batches:
             break
-        output = encode_last_transition(lewm, raw, device)
-        z, action = output["emb"], output["act_emb"]
+        z, action = encode_last_transition(encoder, raw, device)
         bank.add(z[:, -2], action[:, -2], z[:, -1] - z[:, -2])
         if batch_index == 0:
             print(f"emb={tuple(z.shape)} act_emb={tuple(action.shape)}")
@@ -206,8 +250,7 @@ def main():
     for batch_index, raw in enumerate(DataLoader(Subset(dataset, heldout_indices), **loader_kwargs)):
         if args.max_batches and batch_index >= args.max_batches:
             break
-        output = encode_last_transition(lewm, raw, device)
-        z, action = output["emb"], output["act_emb"]
+        z, action = encode_last_transition(encoder, raw, device)
         values = bank.query(z[:, -2], action[:, -2], z[:, -1] - z[:, -2])
         novelty.append(values["novelty"].flatten().cpu())
         ambiguity.append(values["local_ambiguity"].flatten().cpu())
