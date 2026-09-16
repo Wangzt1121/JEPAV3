@@ -12,6 +12,7 @@ results/
 *.pth
 *.ckpt
 *.log
+*.pid
 
 wandb/
 .hydra/
