@@ -1,0 +1,40 @@
+checkpoint: /mnt/aaa5090/wzt/robort/JEPAV3/checkpoints/official/lewm-pusht-current
+method: aefe # aefe or random
+device: cuda
+img_size: 224
+history_size: null
+frameskip: 5
+artifacts:
+  bank: /mnt/aaa5090/wzt/robort/JEPAV3/checkpoints/aefe/training_free/frontier_bank.pt
+  stats: /mnt/aaa5090/wzt/robort/JEPAV3/checkpoints/aefe/training_free/frontier_stats.pt
+world:
+  env_name: swm/PushT-v1
+  max_episode_steps: 1000
+planning:
+  horizon: 1
+  num_samples: 300
+  topk: 30
+  iterations: 10
+  var_scale: 1.0
+  gamma: 0.9
+frontier:
+  beta_ambiguity: 0.5
+  invalid_penalty: 1.0
+  min_valid_ratio: 0.6
+  use_context_gate: true
+  use_consistency_gate: true
+  rollout_reliability: true
+  prediction_error_limit: 0.021342629566788673
+  reliability_decay: 0.5
+  error_fallback_steps: 1
+memory_bank:
+  online_update: false
+exploration:
+  total_steps: 1000
+output_dir: /mnt/aaa5090/wzt/robort/JEPAV3/datasets
+output_dataset: ${output_dir}/pusht_training_free_aefe.h5
+output_bank: /mnt/aaa5090/wzt/robort/JEPAV3/checkpoints/aefe/training_free/frontier_bank_online.pt
+debug_frontier: true
+wandb:
+  enabled: false
+seed: 42
