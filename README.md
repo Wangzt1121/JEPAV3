@@ -180,5 +180,138 @@ PY
 
 After conversion, load via `swm.policy.AutoCostModel('pusht/lewm')` as usual.
 
+## Training-Free AEFE: formal PushT workflow
+
+The AEFE pipeline uses one implementation for validation and collection:
+
+```text
+CEM continuous search
+  -> frozen LeWM rollout
+  -> ActionEffectMemory cosine KNN
+  -> FrontierScore (novelty - beta * ambiguity)
+```
+
+The Bank is fixed during collection (`memory_bank.online_update=false`). Bank,
+calibration, and test data are split by episode. Within the Bank and calibration
+sets, transitions are sampled round-robin across episodes and action-block starts
+are separated by at least `frameskip`, so the five-action blocks do not overlap.
+
+### 1. Set paths
+
+Run all commands from the repository on the server:
+
+```bash
+cd /mnt/aaa5090/wzt/robort/JEPAV3
+source .venv/bin/activate
+
+export AEFE_PROJECT=/mnt/aaa5090/wzt/robort/JEPAV3
+export AEFE_SOURCE=/mnt/aaa5090/wzt/robort/dataset/raw/pusht_expert_train.h5
+export AEFE_CHECKPOINT=$AEFE_PROJECT/checkpoints/official/lewm-pusht-current
+export AEFE_ARTIFACTS=$AEFE_PROJECT/checkpoints/aefe/training_free
+export AEFE_DATA=$AEFE_PROJECT/datasets/pusht_training_free_aefe_100k.h5
+export STABLEWM_HOME=/mnt/aaa5090/wzt/.stable_worldmodel
+```
+
+The output HDF5 and validation directory must not already exist. The writer uses
+error-on-existing mode to prevent an old run from being silently mixed into a
+new dataset.
+
+### 2. Build the fixed 20K Bank and calibration statistics
+
+This command creates an 80%/10%/10% episode split for Bank/calibration/test.
+The held-out test episodes are recorded in Bank metadata and are not used for
+Bank construction or calibration.
+
+```bash
+python build_frontier_bank.py \
+  --checkpoint "$AEFE_CHECKPOINT" \
+  --dataset "$AEFE_SOURCE" \
+  --stats-dataset "$AEFE_SOURCE" \
+  --output "$AEFE_ARTIFACTS" \
+  --max-size 20000 \
+  --calibration-size 4096 \
+  --calibration-fraction 0.10 \
+  --test-fraction 0.10 \
+  --history-size 3 \
+  --frameskip 5 \
+  --knn-k 10 \
+  --device cuda
+```
+
+Old Bank artifacts are intentionally rejected by `explore.py`. Rebuild the Bank
+after changing the sampler or calibration logic.
+
+### 3. Run the production-path validation
+
+This is a paired validation on strictly held-out episodes. It uses the same
+`FrontierCostModel`, `FrontierScore`, `ActionEffectMemory`, and CEM settings as
+the collector. CEM is free to produce actions absent from the expert Bank.
+
+```bash
+python validate_frontier_official.py \
+  --dataset "$AEFE_SOURCE" \
+  --checkpoint-dir "$AEFE_CHECKPOINT" \
+  --bank "$AEFE_ARTIFACTS/frontier_bank.pt" \
+  --stats "$AEFE_ARTIFACTS/frontier_stats.pt" \
+  --output "$AEFE_PROJECT/results/frontier_formal_pusht_seed42" \
+  --test-states 100 \
+  --num-samples 300 \
+  --topk 30 \
+  --iterations 10 \
+  --seed 42 \
+  --device cuda
+```
+
+The main outputs are `paired_results.csv`, `summary.json`, and `manifest.json`.
+The paired comparison reports real post-execution novelty, local ambiguity, and
+LeWM prediction error for Frontier versus Random from identical initial states.
+
+### 4. Generate the formal 100K-transition AEFE dataset
+
+```bash
+python explore.py \
+  checkpoint="$AEFE_CHECKPOINT" \
+  artifacts.bank="$AEFE_ARTIFACTS/frontier_bank.pt" \
+  artifacts.stats="$AEFE_ARTIFACTS/frontier_stats.pt" \
+  memory_bank.online_update=false \
+  exploration.total_steps=100000 \
+  output_dataset="$AEFE_DATA" \
+  output_bank="$AEFE_ARTIFACTS/frontier_bank_after_collection.pt" \
+  seed=42
+```
+
+At every episode reset, the planner history is initialized by repeating the
+initial frame and supplying zero-action blocks. No random environment steps are
+inserted solely to fill history. Every stored primitive transition includes:
+
+- `collection_mode=-1`: terminal observation
+- `collection_mode=0`: Random baseline decision
+- `collection_mode=1`: normal Frontier decision
+- `collection_mode=2`: prediction-error fallback decision
+- `decision_id`: the macro decision that selected the action block
+- `action_in_block`: primitive action position inside the five-action block
+
+With `frameskip=5`, 100,000 primitive environment transitions correspond to
+approximately 20,000 Frontier macro decisions. Episode termination can make the
+exact number slightly different; `explore.py` prints both counts at completion.
+
+### 5. Train LeWM on the generated AEFE data
+
+The extra provenance columns are retained in HDF5 but ignored by the standard
+LeWM training columns. Train directly from the generated dataset with:
+
+```bash
+python train.py \
+  data=pusht \
+  data.dataset.name="$AEFE_DATA" \
+  output_model_name=lewm_pusht_aefe_100k \
+  subdir=pusht_aefe_100k \
+  wandb.enabled=false
+```
+
+The model checkpoints and resolved training config are written below the
+`checkpoints/pusht_aefe_100k` directory under `STABLEWM_HOME`. Enable WandB only
+after setting the desired entity and project in `config/train/lewm.yaml`.
+
 ## Contact & Contributions
 Feel free to open [issues](https://github.com/lucas-maes/le-wm/issues)! For questions or collaborations, please contact `lucas.maes@mila.quebec`

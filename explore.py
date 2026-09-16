@@ -17,6 +17,12 @@ from frontier.score import FrontierScore
 from utils import get_img_preprocessor
 
 
+COLLECTION_TERMINAL = -1
+COLLECTION_RANDOM = 0
+COLLECTION_FRONTIER = 1
+COLLECTION_ERROR_FALLBACK = 2
+
+
 def _numpy(value):
     return value.detach().cpu().numpy() if torch.is_tensor(value) else np.asarray(value)
 
@@ -47,9 +53,14 @@ def run(cfg: DictConfig):
     device = torch.device(str(cfg.device))
     bank = ActionEffectMemory.load(cfg.artifacts.bank, device="cpu")
     stats = torch.load(cfg.artifacts.stats, map_location="cpu", weights_only=True)
-    if stats.get("format_version") != 1:
-        raise ValueError("frontier artifacts were not built by build_frontier_bank.py")
+    if stats.get("format_version") != 2:
+        raise ValueError(
+            "frontier artifacts use an obsolete sampling format; "
+            "rebuild them with build_frontier_bank.py"
+        )
     metadata = bank.metadata
+    if metadata.get("sampling_version") != 2:
+        raise ValueError("the Bank is not episode-balanced and non-overlapping")
     history = int(metadata["history_size"] if cfg.history_size is None else cfg.history_size)
     for key, value in (("checkpoint", str(cfg.checkpoint)),
                        ("history_size", history), ("frameskip", int(cfg.frameskip)),
@@ -112,25 +123,54 @@ def run(cfg: DictConfig):
         value = torch.from_numpy(np.stack(frames)).permute(0, 3, 1, 2)
         return image_transform({"pixels": value})["pixels"].unsqueeze(0).to(device)
 
+    zero_action = np.zeros((block, *low.shape), dtype=np.float32)
+    zero_action_normalized = ((zero_action - mean) / std).reshape(-1).astype(np.float32)
+
+    def initialize_history(observation):
+        frames.clear()
+        past_actions.clear()
+        for _ in range(history):
+            frames.append(observation["pixels"].copy())
+        for _ in range(history - 1):
+            past_actions.append(zero_action_normalized.copy())
+
+    def terminal_row(observation, decision_id):
+        return {
+            **observation,
+            "action": np.full_like(mean, np.nan, dtype=np.float32),
+            "collection_mode": np.int8(COLLECTION_TERMINAL),
+            "decision_id": np.int64(decision_id),
+            "action_in_block": np.int16(-1),
+        }
+
     frames = deque(maxlen=history)
     past_actions = deque(maxlen=max(1, history - 1))
-    rows, steps, episode = [], 0, 0
+    rows, steps, episode, decisions = [], 0, 0, 0
+    decision_counts = {
+        COLLECTION_RANDOM: 0,
+        COLLECTION_FRONTIER: 0,
+        COLLECTION_ERROR_FALLBACK: 0,
+    }
     try:
         with HDF5Writer(Path(cfg.output_dataset), mode="error") as writer:
             _, info = world.envs.reset(seed=int(cfg.seed))
             current = _observation(info)
-            frames.append(current["pixels"])
+            initialize_history(current)
             while steps < int(cfg.exploration.total_steps):
                 selected_metrics = None
                 predicted_next = None
                 used_error_fallback = False
-                if len(frames) < history or method == "random":
+                if method == "random":
                     selected = rng.uniform(low, high, size=(block, *low.shape)).astype(np.float32)
+                    collection_mode = COLLECTION_RANDOM
                 else:
                     used_error_fallback = scorer.fallback_active
+                    collection_mode = (
+                        COLLECTION_ERROR_FALLBACK
+                        if used_error_fallback else COLLECTION_FRONTIER
+                    )
                     planning_info = {"pixels": pixels(list(frames))}
-                    past = (torch.as_tensor(np.stack(past_actions), device=device)
-                            if past_actions else torch.empty(0, normalized_low.size, device=device))
+                    past = torch.as_tensor(np.stack(past_actions), device=device)
                     planning_info["action"] = past.unsqueeze(0)
                     expanded = {key: value.unsqueeze(1) for key, value in planning_info.items()}
                     result = solver(planning_info)
@@ -145,10 +185,21 @@ def run(cfg: DictConfig):
 
                 start_pixels = current["pixels"].copy()
                 executed, terminated = [], False
-                for action in selected:
+                current_decision = decisions
+                decisions += 1
+                decision_counts[collection_mode] += 1
+                for action_in_block, action in enumerate(selected):
                     if steps >= int(cfg.exploration.total_steps):
                         break
-                    rows.append({key: value.copy() for key, value in current.items()} | {"action": action.copy()})
+                    rows.append(
+                        {key: value.copy() for key, value in current.items()}
+                        | {
+                            "action": action.copy(),
+                            "collection_mode": np.int8(collection_mode),
+                            "decision_id": np.int64(current_decision),
+                            "action_in_block": np.int16(action_in_block),
+                        }
+                    )
                     _, _, dead, truncated, info = world.envs.step(action[None])
                     current = _observation(info)
                     executed.append(action.copy())
@@ -181,7 +232,7 @@ def run(cfg: DictConfig):
                     )
                 if terminated:
                     if rows:
-                        terminal = {**current, "action": np.full_like(mean, np.nan, dtype=np.float32)}
+                        terminal = terminal_row(current, current_decision)
                         episode_rows = rows + [terminal]
                         writer.write_episode({key: [row[key] for row in episode_rows] for key in terminal})
                         rows.clear()
@@ -189,16 +240,22 @@ def run(cfg: DictConfig):
                     if steps < int(cfg.exploration.total_steps):
                         _, info = world.envs.reset(seed=int(cfg.seed) + episode)
                         current = _observation(info)
-                        frames.clear(); past_actions.clear(); frames.append(current["pixels"])
+                        initialize_history(current)
                         scorer.reset_reliability()
             if rows:
-                terminal = {**current, "action": np.full_like(mean, np.nan, dtype=np.float32)}
+                terminal = terminal_row(current, decisions - 1)
                 episode_rows = rows + [terminal]
                 writer.write_episode({key: [row[key] for row in episode_rows] for key in terminal})
     finally:
         world.close()
         bank.save(cfg.output_bank)
-    print(f"real_steps={steps} bank_size={len(bank)} dataset={cfg.output_dataset}")
+    print(
+        f"primitive_steps={steps} macro_decisions={decisions} "
+        f"random_decisions={decision_counts[COLLECTION_RANDOM]} "
+        f"frontier_decisions={decision_counts[COLLECTION_FRONTIER]} "
+        f"error_fallback_decisions={decision_counts[COLLECTION_ERROR_FALLBACK]} "
+        f"bank_size={len(bank)} dataset={cfg.output_dataset}"
+    )
 
 
 if __name__ == "__main__":

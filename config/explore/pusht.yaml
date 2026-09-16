@@ -30,11 +30,11 @@ frontier:
 memory_bank:
   online_update: false
 exploration:
-  total_steps: 1000
+  total_steps: 100000
 output_dir: /mnt/aaa5090/wzt/robort/JEPAV3/datasets
-output_dataset: ${output_dir}/pusht_training_free_aefe.h5
-output_bank: /mnt/aaa5090/wzt/robort/JEPAV3/checkpoints/aefe/training_free/frontier_bank_online.pt
-debug_frontier: true
+output_dataset: ${output_dir}/pusht_training_free_aefe_100k.h5
+output_bank: /mnt/aaa5090/wzt/robort/JEPAV3/checkpoints/aefe/training_free/frontier_bank_after_collection.pt
+debug_frontier: false
 wandb:
   enabled: false
 seed: 42

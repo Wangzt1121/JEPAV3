@@ -103,7 +103,7 @@ class FrontierScore:
                 joint_risk.new_full((), -(self.invalid_penalty + 1e3)),
             )
         else:
-            reward = novelty_norm + self.beta * ambiguity_norm
+            reward = novelty_norm - self.beta * ambiguity_norm
             reward = torch.where(valid, reward, reward.new_full((), -self.invalid_penalty))
         return {
             "reward": reward,

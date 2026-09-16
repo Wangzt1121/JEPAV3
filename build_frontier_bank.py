@@ -38,26 +38,71 @@ def load_dataset(name, history_size, frameskip, img_size, action_stats):
     )
 
 
-def split_episodes(dataset, fraction, seed):
+def split_episodes(dataset, calibration_fraction, test_fraction, seed):
+    """Create strict Bank/calibration/test episode partitions."""
     episodes = np.unique([int(ep) for ep, _ in dataset.clip_indices])
-    if len(episodes) < 2 or not 0 < fraction < 1:
-        raise ValueError("bank construction needs at least two episodes")
-    count = min(len(episodes) - 1, max(1, int(round(len(episodes) * fraction))))
-    validation = set(np.random.default_rng(seed).permutation(episodes)[:count].tolist())
-    train, heldout = [], []
+    if len(episodes) < 3:
+        raise ValueError("bank construction needs at least three episodes")
+    if min(calibration_fraction, test_fraction) <= 0:
+        raise ValueError("calibration and test fractions must be positive")
+    if calibration_fraction + test_fraction >= 1:
+        raise ValueError("calibration and test fractions must sum to less than one")
+
+    episodes = np.random.default_rng(seed).permutation(episodes)
+    calibration_count = max(1, int(round(len(episodes) * calibration_fraction)))
+    test_count = max(1, int(round(len(episodes) * test_fraction)))
+    if calibration_count + test_count >= len(episodes):
+        raise ValueError("episode split leaves no episodes for the Bank")
+    calibration = set(episodes[:calibration_count].tolist())
+    test = set(episodes[calibration_count:calibration_count + test_count].tolist())
+    bank = set(episodes[calibration_count + test_count:].tolist())
+
+    partitions = {"bank": [], "calibration": [], "test": []}
     for index, (episode, _) in enumerate(dataset.clip_indices):
-        (heldout if int(episode) in validation else train).append(index)
-    return train, heldout, sorted(validation)
+        episode = int(episode)
+        if episode in bank:
+            partitions["bank"].append(index)
+        elif episode in calibration:
+            partitions["calibration"].append(index)
+        elif episode in test:
+            partitions["test"].append(index)
+    return partitions, {
+        "bank": sorted(bank),
+        "calibration": sorted(calibration),
+        "test": sorted(test),
+    }
 
 
-def sample_unique_indices(dataset, indices, count, rng):
-    """Sample unique episode/step clips before encoding or FIFO insertion."""
-    unique = {}
+def sample_episode_balanced_nonoverlapping(dataset, indices, count, frameskip, rng):
+    """Round-robin episodes and keep disjoint raw-action blocks."""
+    grouped = {}
     for index in indices:
-        unique.setdefault(tuple(map(int, dataset.clip_indices[index])), index)
-    values = np.asarray(list(unique.values()), dtype=np.int64)
-    rng.shuffle(values)
-    return values[:count].tolist()
+        episode, start = map(int, dataset.clip_indices[index])
+        grouped.setdefault(episode, {}).setdefault(start, index)
+
+    pools = {}
+    for episode, by_start in grouped.items():
+        starts = np.asarray(sorted(by_start), dtype=np.int64)
+        residues = np.unique(starts % frameskip)
+        residue = int(rng.choice(residues))
+        selected = [by_start[int(start)] for start in starts if start % frameskip == residue]
+        rng.shuffle(selected)
+        if selected:
+            pools[episode] = selected
+
+    sampled = []
+    active = list(pools)
+    while active and len(sampled) < count:
+        rng.shuffle(active)
+        next_active = []
+        for episode in active:
+            sampled.append(pools[episode].pop())
+            if pools[episode]:
+                next_active.append(episode)
+            if len(sampled) == count:
+                break
+        active = next_active
+    return sampled
 
 
 def move_batch(batch, device):
@@ -83,7 +128,11 @@ def main():
     parser.add_argument("--history-size", type=int, default=3)
     parser.add_argument("--frameskip", type=int, default=5)
     parser.add_argument("--img-size", type=int, default=224)
-    parser.add_argument("--validation-fraction", type=float, default=0.1)
+    parser.add_argument(
+        "--calibration-fraction", "--validation-fraction",
+        dest="calibration_fraction", type=float, default=0.1,
+    )
+    parser.add_argument("--test-fraction", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--num-workers", type=int, default=0)
@@ -103,16 +152,24 @@ def main():
     action_stats = fit_action_stats(stats_dataset)
     dataset = load_dataset(args.dataset, args.history_size, args.frameskip,
                            args.img_size, action_stats)
-    train_indices, heldout_indices, validation_episodes = split_episodes(
-        dataset, args.validation_fraction, args.seed
+    partitions, episode_split = split_episodes(
+        dataset, args.calibration_fraction, args.test_fraction, args.seed
     )
     rng = np.random.default_rng(args.seed)
-    train_indices = sample_unique_indices(
-        dataset, train_indices, args.max_size, rng
+    train_indices = sample_episode_balanced_nonoverlapping(
+        dataset, partitions["bank"], args.max_size, args.frameskip, rng
     )
-    heldout_indices = sample_unique_indices(
-        dataset, heldout_indices, args.calibration_size, rng
+    heldout_indices = sample_episode_balanced_nonoverlapping(
+        dataset, partitions["calibration"], args.calibration_size,
+        args.frameskip, rng,
     )
+    if len(train_indices) < args.max_size:
+        print(f"requested_bank_size={args.max_size} available={len(train_indices)}")
+    if len(heldout_indices) < args.calibration_size:
+        print(
+            f"requested_calibration_size={args.calibration_size} "
+            f"available={len(heldout_indices)}"
+        )
     bank = ActionEffectMemory(args.max_size, args.knn_k, device="cpu")
     loader_kwargs = dict(batch_size=args.batch_size, shuffle=False,
                          num_workers=args.num_workers)
@@ -131,9 +188,17 @@ def main():
         "checkpoint": str(args.checkpoint), "dataset": str(args.dataset),
         "stats_dataset": str(stats_dataset), "history_size": args.history_size,
         "frameskip": args.frameskip, "img_size": args.img_size,
-        "validation_episodes": validation_episodes, "action_stats": action_stats,
+        "bank_episodes": episode_split["bank"],
+        "calibration_episodes": episode_split["calibration"],
+        "test_episodes": episode_split["test"],
+        "validation_episodes": episode_split["calibration"],
+        "action_stats": action_stats,
         "descriptor_type": "action_effect", "bank_size": len(bank),
-        "sampling": "unique episode-step clips, seeded without replacement",
+        "sampling_version": 2,
+        "sampling": (
+            "strict episode split; seeded episode-round-robin sampling; "
+            "transition starts separated by frameskip within each episode"
+        ),
         "transition_per_clip": "last only",
     }
     bank.metadata = metadata
@@ -156,7 +221,7 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
     bank.save(output_dir / "frontier_bank.pt")
     torch.save({
-        "format_version": 1,
+        "format_version": 2,
         "metadata": metadata,
         "novelty": quantiles(novelty),
         "ambiguity": quantiles(ambiguity),
