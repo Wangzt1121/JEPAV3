@@ -198,6 +198,10 @@ prior, and CEM may only select a bounded perturbation around that prior. The
 paired baseline uses the same retrieved expert block and one Gaussian
 perturbation without Frontier selection.
 
+If CEM cannot find a candidate with `valid_ratio >= 0.6`, collection executes a
+real Expert+Noise action instead of silently accepting a gate-rejected or nearly
+unchanged expert action. That decision is recorded as `collection_mode=2`.
+
 The Bank is fixed during collection (`memory_bank.online_update=false`). Bank,
 calibration, and test data are split by episode. Within the Bank and calibration
 sets, transitions are sampled round-robin across episodes and action-block starts
@@ -312,13 +316,14 @@ inserted solely to fill history. Every stored primitive transition includes:
 - `collection_mode=-1`: terminal observation
 - `collection_mode=0`: Random baseline decision
 - `collection_mode=1`: normal Frontier decision
-- `collection_mode=2`: prediction-error fallback decision
+- `collection_mode=2`: prediction-error or no-valid-candidate fallback decision
 - `collection_mode=3`: pure Expert+Noise baseline decision
 - `decision_id`: the macro decision that selected the action block
 - `action_in_block`: primitive action position inside the five-action block
 - `expert_action`: retrieved expert primitive action before perturbation
 - `action_noise`: executed primitive action minus `expert_action`
 - `expert_similarity`: cosine similarity of the retrieved Bank state
+- `planned_valid_ratio`: CEM validity before any Expert+Noise fallback
 
 With `frameskip=5`, 100,000 primitive environment transitions correspond to
 approximately 20,000 Frontier macro decisions. Episode termination can make the

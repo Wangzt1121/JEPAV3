@@ -377,6 +377,13 @@ def main():
                 expert_noise_predicted, expert_noise_next = evaluate_sequence(
                     info, expert_noise_normalized
                 )
+                frontier_valid_ratio = frontier_predicted["valid_ratio"]
+                frontier_fallback = frontier_valid_ratio < args.min_valid_ratio
+                if frontier_fallback:
+                    frontier_raw = expert_noise_raw.copy()
+                    frontier_normalized = expert_noise_normalized.copy()
+                    frontier_predicted = expert_noise_predicted.copy()
+                    frontier_next = expert_noise_next.clone()
 
                 state = np.asarray(data["state"][row], dtype=np.float64)
                 goal_state = goal_states[episode]
@@ -387,6 +394,7 @@ def main():
                         frontier_normalized,
                         frontier_predicted,
                         frontier_next,
+                        frontier_fallback,
                     ),
                     (
                         "expert_noise",
@@ -394,9 +402,11 @@ def main():
                         expert_noise_normalized,
                         expert_noise_predicted,
                         expert_noise_next,
+                        False,
                     ),
                 )
-                for method, raw_block, normalized_block, predicted, predicted_next in candidates:
+                for (method, raw_block, normalized_block, predicted,
+                     predicted_next, fallback_used) in candidates:
                     actual, actual_next, terminated = execute_and_measure(
                         envs[method],
                         state,
@@ -410,6 +420,8 @@ def main():
                         "episode": episode,
                         "step": step,
                         "method": method,
+                        "fallback_used": fallback_used,
+                        "frontier_planned_valid_ratio": frontier_valid_ratio,
                         "expert_similarity": expert_similarity[0].item(),
                         "action_noise_rms": float(
                             np.sqrt(np.mean((raw_block - expert_raw) ** 2))
@@ -443,6 +455,9 @@ def main():
     }
     summary = {
         "samples": int(frame.state_id.nunique()),
+        "frontier_fallback_states": int(
+            frame.loc[frame.method == "frontier", "fallback_used"].sum()
+        ),
         "method_means": frame.groupby("method")[
             ["real_novelty", "real_ambiguity", "prediction_error"]
         ].mean().to_dict(orient="index"),

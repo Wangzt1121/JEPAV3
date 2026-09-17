@@ -111,6 +111,15 @@ def run(cfg: DictConfig):
         raise ValueError("expert noise sigma and max deviation must be positive")
     raw_sigma = np.full_like(mean, noise_sigma, dtype=np.float32)
     normalized_sigma = np.tile(raw_sigma / std, block).astype(np.float32)
+
+    def perturb_expert(expert_action):
+        noise = rng.normal(0.0, raw_sigma, size=expert_action.shape)
+        noise = np.clip(
+            noise,
+            -max_noise_std * raw_sigma,
+            max_noise_std * raw_sigma,
+        )
+        return np.clip(expert_action + noise, low, high).astype(np.float32)
     model = FrontierCostModel(
         lewm, bank, scorer, history,
         gamma=float(cfg.planning.gamma),
@@ -152,6 +161,7 @@ def run(cfg: DictConfig):
             "expert_action": np.full_like(mean, np.nan, dtype=np.float32),
             "action_noise": np.full_like(mean, np.nan, dtype=np.float32),
             "expert_similarity": np.float32(np.nan),
+            "planned_valid_ratio": np.float32(np.nan),
             "collection_mode": np.int8(COLLECTION_TERMINAL),
             "decision_id": np.int64(decision_id),
             "action_in_block": np.int16(-1),
@@ -175,6 +185,7 @@ def run(cfg: DictConfig):
                 selected_metrics = None
                 predicted_next = None
                 used_error_fallback = False
+                planned_valid_ratio = float("nan")
                 if method == "random":
                     selected = rng.uniform(low, high, size=(block, *low.shape)).astype(np.float32)
                     expert_raw = np.full_like(selected, np.nan, dtype=np.float32)
@@ -193,13 +204,7 @@ def run(cfg: DictConfig):
                         high,
                     ).astype(np.float32)
                     if method == "expert_noise":
-                        noise = rng.normal(0.0, raw_sigma, size=expert_raw.shape)
-                        noise = np.clip(
-                            noise,
-                            -max_noise_std * raw_sigma,
-                            max_noise_std * raw_sigma,
-                        )
-                        selected = np.clip(expert_raw + noise, low, high).astype(np.float32)
+                        selected = perturb_expert(expert_raw)
                         collection_mode = COLLECTION_EXPERT_NOISE
                     else:
                         used_error_fallback = scorer.fallback_active
@@ -227,8 +232,26 @@ def run(cfg: DictConfig):
                         model.get_cost(expanded, sequence)
                         selected_metrics = model.last_metrics
                         predicted_next = model.last_first_prediction[0, 0]
+                        planned_valid_ratio = float(
+                            selected_metrics["valid_ratio"][0, 0]
+                        )
                         selected = sequence[0, 0, history - 1].cpu().numpy().reshape(block, -1)
                         selected = np.clip(selected * std + mean, low, high).astype(np.float32)
+                        if planned_valid_ratio < float(cfg.frontier.min_valid_ratio):
+                            selected = perturb_expert(expert_raw)
+                            collection_mode = COLLECTION_ERROR_FALLBACK
+                            fallback_normalized = (
+                                (selected - mean) / std
+                            ).reshape(-1)
+                            fallback_sequence = sequence.clone()
+                            fallback_sequence[0, 0, history - 1] = torch.as_tensor(
+                                fallback_normalized,
+                                device=device,
+                                dtype=fallback_sequence.dtype,
+                            )
+                            model.get_cost(expanded, fallback_sequence)
+                            selected_metrics = model.last_metrics
+                            predicted_next = model.last_first_prediction[0, 0]
 
                 start_pixels = current["pixels"].copy()
                 executed, terminated = [], False
@@ -247,6 +270,7 @@ def run(cfg: DictConfig):
                                 action - expert_raw[action_in_block]
                             ).astype(np.float32),
                             "expert_similarity": np.float32(expert_similarity),
+                            "planned_valid_ratio": np.float32(planned_valid_ratio),
                             "collection_mode": np.int8(collection_mode),
                             "decision_id": np.int64(current_decision),
                             "action_in_block": np.int16(action_in_block),
