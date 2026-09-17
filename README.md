@@ -185,11 +185,18 @@ After conversion, load via `swm.policy.AutoCostModel('pusht/lewm')` as usual.
 The AEFE pipeline uses one implementation for validation and collection:
 
 ```text
-CEM continuous search
+current latent -> nearest expert action block in the fixed Bank
+  -> Gaussian neighborhood (sigma=0.05, clipped at 2.5 sigma)
+  -> local CEM search
   -> frozen LeWM rollout
   -> ActionEffectMemory cosine KNN
   -> FrontierScore (novelty - beta * ambiguity)
 ```
+
+This is not unconstrained CEM. The nearest-neighbor expert block is the action
+prior, and CEM may only select a bounded perturbation around that prior. The
+paired baseline uses the same retrieved expert block and one Gaussian
+perturbation without Frontier selection.
 
 The Bank is fixed during collection (`memory_bank.online_update=false`). Bank,
 calibration, and test data are split by episode. Within the Bank and calibration
@@ -207,8 +214,8 @@ source .venv/bin/activate
 export AEFE_PROJECT=/mnt/aaa5090/wzt/robort/JEPAV3
 export AEFE_SOURCE=/mnt/aaa5090/wzt/robort/dataset/raw/pusht_expert_train.h5
 export AEFE_CHECKPOINT=$AEFE_PROJECT/checkpoints/official/lewm-pusht-current
-export AEFE_ARTIFACTS=$AEFE_PROJECT/checkpoints/aefe/training_free
-export AEFE_DATA=$AEFE_PROJECT/datasets/pusht_training_free_aefe_100k.h5
+export AEFE_ARTIFACTS=$AEFE_PROJECT/checkpoints/aefe/training_free_expert_noise
+export AEFE_DATA=$AEFE_PROJECT/datasets/pusht_expert_noise_frontier_100k.h5
 export STABLEWM_HOME=/mnt/aaa5090/wzt/.stable_worldmodel
 ```
 
@@ -220,7 +227,9 @@ new dataset.
 
 This command creates an 80%/10%/10% episode split for Bank/calibration/test.
 The held-out test episodes are recorded in Bank metadata and are not used for
-Bank construction or calibration.
+Bank construction or calibration. Each Bank row also stores the normalized raw
+five-action expert block needed by the action prior, so the old Bank must not be
+reused.
 
 ```bash
 python build_frontier_bank.py \
@@ -251,8 +260,8 @@ after changing the sampler or calibration logic.
 ### 3. Run the production-path validation
 
 This is a paired validation on strictly held-out episodes. It uses the same
-`FrontierCostModel`, `FrontierScore`, `ActionEffectMemory`, and CEM settings as
-the collector. CEM is free to produce actions absent from the expert Bank.
+`FrontierCostModel`, `FrontierScore`, `ActionEffectMemory`, expert-action prior,
+and local CEM settings as the collector.
 
 ```bash
 python validate_frontier_official.py \
@@ -260,18 +269,23 @@ python validate_frontier_official.py \
   --checkpoint-dir "$AEFE_CHECKPOINT" \
   --bank "$AEFE_ARTIFACTS/frontier_bank.pt" \
   --stats "$AEFE_ARTIFACTS/frontier_stats.pt" \
-  --output "$AEFE_PROJECT/results/frontier_formal_pusht_seed42" \
+  --output "$AEFE_PROJECT/results/expert_noise_frontier_formal_pusht_seed42" \
   --test-states 100 \
   --num-samples 300 \
   --topk 30 \
   --iterations 10 \
+  --noise-sigma 0.05 \
+  --max-noise-std 2.5 \
+  --prior-penalty 0.05 \
   --seed 42 \
   --device cuda
 ```
 
 The main outputs are `paired_results.csv`, `summary.json`, and `manifest.json`.
 The paired comparison reports real post-execution novelty, local ambiguity, and
-LeWM prediction error for Frontier versus Random from identical initial states.
+LeWM prediction error for local Frontier versus Expert+Noise from identical
+initial states. This isolates Frontier selection because both methods use the
+same expert-action retrieval and noise scale.
 
 ### 4. Generate the formal 100K-transition AEFE dataset
 
@@ -281,6 +295,10 @@ python explore.py \
   artifacts.bank="$AEFE_ARTIFACTS/frontier_bank.pt" \
   artifacts.stats="$AEFE_ARTIFACTS/frontier_stats.pt" \
   memory_bank.online_update=false \
+  world.max_episode_steps=250 \
+  expert_noise.sigma=0.05 \
+  expert_noise.max_deviation_std=2.5 \
+  expert_noise.prior_penalty=0.05 \
   exploration.total_steps=100000 \
   output_dataset="$AEFE_DATA" \
   output_bank="$AEFE_ARTIFACTS/frontier_bank_after_collection.pt" \
@@ -295,12 +313,18 @@ inserted solely to fill history. Every stored primitive transition includes:
 - `collection_mode=0`: Random baseline decision
 - `collection_mode=1`: normal Frontier decision
 - `collection_mode=2`: prediction-error fallback decision
+- `collection_mode=3`: pure Expert+Noise baseline decision
 - `decision_id`: the macro decision that selected the action block
 - `action_in_block`: primitive action position inside the five-action block
+- `expert_action`: retrieved expert primitive action before perturbation
+- `action_noise`: executed primitive action minus `expert_action`
+- `expert_similarity`: cosine similarity of the retrieved Bank state
 
 With `frameskip=5`, 100,000 primitive environment transitions correspond to
 approximately 20,000 Frontier macro decisions. Episode termination can make the
 exact number slightly different; `explore.py` prints both counts at completion.
+The 250-step episode cap produces about 400 independently seeded episodes rather
+than about 100 long episodes, reducing trajectory-level redundancy.
 
 ### 5. Train LeWM on the generated AEFE data
 
@@ -311,13 +335,13 @@ LeWM training columns. Train directly from the generated dataset with:
 python train.py \
   data=pusht \
   data.dataset.name="$AEFE_DATA" \
-  output_model_name=lewm_pusht_aefe_100k \
-  subdir=pusht_aefe_100k \
+  output_model_name=lewm_pusht_expert_noise_frontier_100k \
+  subdir=pusht_expert_noise_frontier_100k \
   wandb.enabled=false
 ```
 
 The model checkpoints and resolved training config are written below the
-`checkpoints/pusht_aefe_100k` directory under `STABLEWM_HOME`. Enable WandB only
+`checkpoints/pusht_expert_noise_frontier_100k` directory under `STABLEWM_HOME`. Enable WandB only
 after setting the desired entity and project in `config/train/lewm.yaml`.
 
 ## Contact & Contributions

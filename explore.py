@@ -21,6 +21,7 @@ COLLECTION_TERMINAL = -1
 COLLECTION_RANDOM = 0
 COLLECTION_FRONTIER = 1
 COLLECTION_ERROR_FALLBACK = 2
+COLLECTION_EXPERT_NOISE = 3
 
 
 def _numpy(value):
@@ -48,8 +49,8 @@ def run(cfg: DictConfig):
     torch.manual_seed(int(cfg.seed))
     rng = np.random.default_rng(int(cfg.seed))
     method = str(cfg.method)
-    if method not in ("aefe", "random"):
-        raise ValueError("method must be 'aefe' or 'random'")
+    if method not in ("aefe", "expert_noise", "random"):
+        raise ValueError("method must be 'aefe', 'expert_noise' or 'random'")
     device = torch.device(str(cfg.device))
     bank = ActionEffectMemory.load(cfg.artifacts.bank, device="cpu")
     stats = torch.load(cfg.artifacts.stats, map_location="cpu", weights_only=True)
@@ -69,6 +70,8 @@ def run(cfg: DictConfig):
             raise ValueError(f"configuration differs from frontier bank: {key}")
     if metadata.get("descriptor_type") != "action_effect":
         raise ValueError("the bank must contain action-effect transitions")
+    if metadata.get("action_prior_version") != 1:
+        raise ValueError("the Bank has no retrievable expert action prior")
     lewm = swm.wm.utils.load_pretrained(cfg.checkpoint).to(device).eval()
     lewm.requires_grad_(False)
     scorer = FrontierScore(
@@ -101,6 +104,13 @@ def run(cfg: DictConfig):
         raise ValueError("environment action dimension differs from the bank")
     normalized_low = np.tile((low - mean) / std, block)
     normalized_high = np.tile((high - mean) / std, block)
+    noise_sigma = float(cfg.expert_noise.sigma)
+    max_noise_std = float(cfg.expert_noise.max_deviation_std)
+    if noise_sigma <= 0 or max_noise_std <= 0:
+        world.close()
+        raise ValueError("expert noise sigma and max deviation must be positive")
+    raw_sigma = np.full_like(mean, noise_sigma, dtype=np.float32)
+    normalized_sigma = np.tile(raw_sigma / std, block).astype(np.float32)
     model = FrontierCostModel(
         lewm, bank, scorer, history,
         gamma=float(cfg.planning.gamma),
@@ -115,7 +125,8 @@ def run(cfg: DictConfig):
     solver = CEMSolver(
         model, batch_size=1, num_samples=int(cfg.planning.num_samples),
         topk=int(cfg.planning.topk), n_steps=int(cfg.planning.iterations),
-        var_scale=float(cfg.planning.var_scale), device=device, seed=int(cfg.seed),
+        var_scale=float(np.sqrt(np.mean(normalized_sigma ** 2))),
+        device=device, seed=int(cfg.seed),
     )
     solver.configure(action_space=world.envs.action_space, n_envs=1, config=plan_config)
 
@@ -138,6 +149,9 @@ def run(cfg: DictConfig):
         return {
             **observation,
             "action": np.full_like(mean, np.nan, dtype=np.float32),
+            "expert_action": np.full_like(mean, np.nan, dtype=np.float32),
+            "action_noise": np.full_like(mean, np.nan, dtype=np.float32),
+            "expert_similarity": np.float32(np.nan),
             "collection_mode": np.int8(COLLECTION_TERMINAL),
             "decision_id": np.int64(decision_id),
             "action_in_block": np.int16(-1),
@@ -150,6 +164,7 @@ def run(cfg: DictConfig):
         COLLECTION_RANDOM: 0,
         COLLECTION_FRONTIER: 0,
         COLLECTION_ERROR_FALLBACK: 0,
+        COLLECTION_EXPERT_NOISE: 0,
     }
     try:
         with HDF5Writer(Path(cfg.output_dataset), mode="error") as writer:
@@ -162,26 +177,58 @@ def run(cfg: DictConfig):
                 used_error_fallback = False
                 if method == "random":
                     selected = rng.uniform(low, high, size=(block, *low.shape)).astype(np.float32)
+                    expert_raw = np.full_like(selected, np.nan, dtype=np.float32)
+                    expert_similarity = float("nan")
                     collection_mode = COLLECTION_RANDOM
                 else:
-                    used_error_fallback = scorer.fallback_active
-                    collection_mode = (
-                        COLLECTION_ERROR_FALLBACK
-                        if used_error_fallback else COLLECTION_FRONTIER
-                    )
                     planning_info = {"pixels": pixels(list(frames))}
                     past = torch.as_tensor(np.stack(past_actions), device=device)
                     planning_info["action"] = past.unsqueeze(0)
-                    expanded = {key: value.unsqueeze(1) for key, value in planning_info.items()}
-                    result = solver(planning_info)
-                    sequence = model.prepare_candidates(
-                        expanded, result["actions"].to(device).unsqueeze(1)
-                    )
-                    model.get_cost(expanded, sequence)
-                    selected_metrics = model.last_metrics
-                    predicted_next = model.last_first_prediction[0, 0]
-                    selected = sequence[0, 0, history - 1].cpu().numpy().reshape(block, -1)
-                    selected = np.clip(selected * std + mean, low, high).astype(np.float32)
+                    current_z = lewm.encode({"pixels": planning_info["pixels"]})["emb"][:, -1]
+                    expert_normalized, similarity = bank.nearest_action(current_z)
+                    expert_similarity = similarity[0].item()
+                    expert_raw = np.clip(
+                        expert_normalized[0].cpu().numpy().reshape(block, -1) * std + mean,
+                        low,
+                        high,
+                    ).astype(np.float32)
+                    if method == "expert_noise":
+                        noise = rng.normal(0.0, raw_sigma, size=expert_raw.shape)
+                        noise = np.clip(
+                            noise,
+                            -max_noise_std * raw_sigma,
+                            max_noise_std * raw_sigma,
+                        )
+                        selected = np.clip(expert_raw + noise, low, high).astype(np.float32)
+                        collection_mode = COLLECTION_EXPERT_NOISE
+                    else:
+                        used_error_fallback = scorer.fallback_active
+                        collection_mode = (
+                            COLLECTION_ERROR_FALLBACK
+                            if used_error_fallback else COLLECTION_FRONTIER
+                        )
+                        model.set_action_prior(
+                            expert_normalized.unsqueeze(1),
+                            torch.as_tensor(normalized_sigma, device=device),
+                            max_noise_std,
+                            float(cfg.expert_noise.prior_penalty),
+                        )
+                        init_action = torch.cat([
+                            planning_info["action"],
+                            expert_normalized.unsqueeze(1),
+                        ], dim=1)
+                        expanded = {
+                            key: value.unsqueeze(1) for key, value in planning_info.items()
+                        }
+                        result = solver(planning_info, init_action=init_action)
+                        sequence = model.prepare_candidates(
+                            expanded, result["actions"].to(device).unsqueeze(1)
+                        )
+                        model.get_cost(expanded, sequence)
+                        selected_metrics = model.last_metrics
+                        predicted_next = model.last_first_prediction[0, 0]
+                        selected = sequence[0, 0, history - 1].cpu().numpy().reshape(block, -1)
+                        selected = np.clip(selected * std + mean, low, high).astype(np.float32)
 
                 start_pixels = current["pixels"].copy()
                 executed, terminated = [], False
@@ -195,6 +242,11 @@ def run(cfg: DictConfig):
                         {key: value.copy() for key, value in current.items()}
                         | {
                             "action": action.copy(),
+                            "expert_action": expert_raw[action_in_block].copy(),
+                            "action_noise": (
+                                action - expert_raw[action_in_block]
+                            ).astype(np.float32),
+                            "expert_similarity": np.float32(expert_similarity),
                             "collection_mode": np.int8(collection_mode),
                             "decision_id": np.int64(current_decision),
                             "action_in_block": np.int16(action_in_block),
@@ -214,7 +266,10 @@ def run(cfg: DictConfig):
                     real = lewm.encode({"pixels": pixels([start_pixels, current["pixels"]])})["emb"]
                     real_action = lewm.action_encoder(torch.as_tensor(normalized, device=device))[:, 0]
                     if bool(cfg.memory_bank.online_update):
-                        bank.add(real[:, 0], real_action, real[:, 1] - real[:, 0])
+                        bank.add(
+                            real[:, 0], real_action, real[:, 1] - real[:, 0],
+                            torch.as_tensor(normalized[:, 0], device=device),
+                        )
                     if predicted_next is not None:
                         real_prediction_error = (predicted_next - real[:, 1]).pow(2).mean().item()
                         scorer.observe_prediction_error(
@@ -254,6 +309,7 @@ def run(cfg: DictConfig):
         f"random_decisions={decision_counts[COLLECTION_RANDOM]} "
         f"frontier_decisions={decision_counts[COLLECTION_FRONTIER]} "
         f"error_fallback_decisions={decision_counts[COLLECTION_ERROR_FALLBACK]} "
+        f"expert_noise_decisions={decision_counts[COLLECTION_EXPERT_NOISE]} "
         f"bank_size={len(bank)} dataset={cfg.output_dataset}"
     )
 

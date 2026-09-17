@@ -29,6 +29,7 @@ class ActionEffectMemory:
         self.effect = empty.clone()
         self.context = empty.clone()
         self.transition = empty.clone()
+        self.action_block = empty.clone()
 
     def __len__(self):
         return int(self.state.shape[0])
@@ -37,31 +38,38 @@ class ActionEffectMemory:
     def _normalize(value):
         return F.normalize(value.float(), dim=-1, eps=1e-8)
 
-    def add(self, z_t, action_emb, delta_z):
-        """Add real transitions ``(z_t, action_embedding, z_next-z_t)``."""
+    def add(self, z_t, action_emb, delta_z, action_block):
+        """Add a real transition and its normalized primitive-action block."""
         if z_t.shape[:-1] != action_emb.shape[:-1] or z_t.shape != delta_z.shape:
             raise ValueError("state, action and effect shapes are not aligned")
+        if action_block.shape[:-1] != z_t.shape[:-1]:
+            raise ValueError("action block and state shapes are not aligned")
         state = self._normalize(z_t.detach()).reshape(-1, z_t.shape[-1])
         action = self._normalize(action_emb.detach()).reshape(-1, action_emb.shape[-1])
         effect = self._normalize(delta_z.detach()).reshape(-1, delta_z.shape[-1])
+        action_block = action_block.detach().float().reshape(-1, action_block.shape[-1])
         if state.shape[0] == 0:
             return
-        if not torch.isfinite(torch.cat([state, action, effect], dim=-1)).all():
+        if not torch.isfinite(torch.cat([state, action, effect, action_block], dim=-1)).all():
             raise ValueError("real transition memory contains nonfinite values")
         context = self._normalize(torch.cat([state, action], dim=-1))
         transition = self._normalize(torch.cat([state, action, effect], dim=-1))
-        values = (state, action, effect, context, transition)
+        values = (state, action, effect, context, transition, action_block)
         values = tuple(value.to(self.device) for value in values)
         if len(self) == 0:
-            self.state, self.action, self.effect, self.context, self.transition = values
+            (self.state, self.action, self.effect, self.context,
+             self.transition, self.action_block) = values
         else:
             if values[0].shape[1] != self.state.shape[1] or values[1].shape[1] != self.action.shape[1]:
                 raise ValueError("memory feature dimensions changed")
+            if values[5].shape[1] != self.action_block.shape[1]:
+                raise ValueError("memory action-block dimension changed")
             self.state = torch.cat([self.state, values[0]], dim=0)
             self.action = torch.cat([self.action, values[1]], dim=0)
             self.effect = torch.cat([self.effect, values[2]], dim=0)
             self.context = torch.cat([self.context, values[3]], dim=0)
             self.transition = torch.cat([self.transition, values[4]], dim=0)
+            self.action_block = torch.cat([self.action_block, values[5]], dim=0)
         if len(self) > self.max_size:
             keep = slice(-self.max_size, None)
             self.state = self.state[keep]
@@ -69,6 +77,7 @@ class ActionEffectMemory:
             self.effect = self.effect[keep]
             self.context = self.context[keep]
             self.transition = self.transition[keep]
+            self.action_block = self.action_block[keep]
 
     def _knn(self, query, table):
         query = self._normalize(query.detach()).reshape(-1, query.shape[-1])
@@ -99,6 +108,17 @@ class ActionEffectMemory:
             all_indices.append(best_indices)
         return torch.cat(all_values), torch.cat(all_indices)
 
+    def nearest_action(self, z_t):
+        """Retrieve the normalized expert action block nearest to each state."""
+        leading = z_t.shape[:-1]
+        similarities, indices = self._knn(z_t, self.state)
+        bank_indices = indices[:, 0].to(self.action_block.device)
+        nearest = self.action_block[bank_indices].to(z_t.device)
+        return (
+            nearest.reshape(*leading, nearest.shape[-1]),
+            similarities[:, 0].reshape(leading),
+        )
+
     def query(self, z_t, action_emb, delta_z):
         """Return non-parametric frontier statistics for candidate effects."""
         if z_t.shape[:-1] != action_emb.shape[:-1] or z_t.shape != delta_z.shape:
@@ -127,7 +147,7 @@ class ActionEffectMemory:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         torch.save({
-            "format_version": 1,
+            "format_version": 2,
             "max_size": self.max_size,
             "knn_k": self.knn_k,
             "chunk_size": self.chunk_size,
@@ -137,17 +157,23 @@ class ActionEffectMemory:
             "effect": self.effect.cpu(),
             "context": self.context.cpu(),
             "transition": self.transition.cpu(),
+            "action_block": self.action_block.cpu(),
             "metadata": self.metadata,
         }, path)
 
     @classmethod
     def load(cls, path, device="cpu"):
         payload = torch.load(path, map_location="cpu", weights_only=True)
-        if payload.get("format_version") != 1:
-            raise ValueError("unsupported training-free frontier bank format")
+        if payload.get("format_version") != 2:
+            raise ValueError(
+                "frontier Bank has no expert action blocks; rebuild it with "
+                "build_frontier_bank.py"
+            )
         bank = cls(payload["max_size"], payload["knn_k"], payload.get("chunk_size", 256),
                     payload.get("bank_chunk_size", 4096), device=device,
                     metadata=payload.get("metadata", {}))
-        for name in ("state", "action", "effect", "context", "transition"):
+        for name in (
+            "state", "action", "effect", "context", "transition", "action_block"
+        ):
             setattr(bank, name, payload[name].to(bank.device))
         return bank

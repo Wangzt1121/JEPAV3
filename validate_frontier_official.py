@@ -41,7 +41,9 @@ def parse_args():
     parser.add_argument("--num-samples", type=int, default=300)
     parser.add_argument("--topk", type=int, default=30)
     parser.add_argument("--iterations", type=int, default=10)
-    parser.add_argument("--var-scale", type=float, default=1.0)
+    parser.add_argument("--noise-sigma", type=float, default=0.05)
+    parser.add_argument("--max-noise-std", type=float, default=2.5)
+    parser.add_argument("--prior-penalty", type=float, default=0.05)
     parser.add_argument("--gamma", type=float, default=0.9)
     parser.add_argument("--beta-ambiguity", type=float, default=0.5)
     parser.add_argument("--invalid-penalty", type=float, default=1.0)
@@ -55,6 +57,8 @@ def parse_args():
         parser.error("test-states and bootstrap-samples must be positive")
     if not 0 < args.topk <= args.num_samples:
         parser.error("topk must be in [1, num-samples]")
+    if args.noise_sigma <= 0 or args.max_noise_std <= 0 or args.prior_penalty < 0:
+        parser.error("expert noise parameters are invalid")
     return args
 
 
@@ -127,6 +131,8 @@ def main():
         )
     if not metadata.get("test_episodes"):
         raise ValueError("Bank metadata has no strictly held-out test episodes")
+    if metadata.get("action_prior_version") != 1:
+        raise ValueError("Bank has no retrievable expert action prior")
     if Path(metadata["dataset"]).resolve() != args.dataset.resolve():
         raise ValueError("validation dataset differs from the Bank source dataset")
     if str(metadata["checkpoint"]) != str(args.checkpoint_dir):
@@ -168,6 +174,8 @@ def main():
         raise ValueError("environment action dimension differs from the Bank")
     normalized_low = np.tile((low - mean) / std, frameskip)
     normalized_high = np.tile((high - mean) / std, frameskip)
+    raw_sigma = np.full_like(mean, args.noise_sigma, dtype=np.float32)
+    normalized_sigma = np.tile(raw_sigma / std, frameskip).astype(np.float32)
     cost_model = FrontierCostModel(
         lewm,
         bank,
@@ -191,7 +199,7 @@ def main():
         num_samples=args.num_samples,
         topk=args.topk,
         n_steps=args.iterations,
-        var_scale=args.var_scale,
+        var_scale=float(np.sqrt(np.mean(normalized_sigma ** 2))),
         device=device,
         seed=args.seed,
     )
@@ -266,7 +274,7 @@ def main():
         "frontier": gym.make(
             "swm/PushT-v1", resolution=image_size, render_mode="rgb_array"
         ),
-        "random": gym.make(
+        "expert_noise": gym.make(
             "swm/PushT-v1", resolution=image_size, render_mode="rgb_array"
         ),
     }
@@ -312,8 +320,28 @@ def main():
                     past_blocks.append(((raw - mean) / std).reshape(-1))
                 info = planning_info(history_pixels, past_blocks)
 
+                current_z = lewm.encode({"pixels": info["pixels"]})["emb"][:, -1]
+                expert_normalized_tensor, expert_similarity = bank.nearest_action(
+                    current_z
+                )
+                expert_normalized = expert_normalized_tensor[0].cpu().numpy()
+                expert_raw = np.clip(
+                    expert_normalized.reshape(frameskip, -1) * std + mean,
+                    low,
+                    high,
+                ).astype(np.float32)
+                cost_model.set_action_prior(
+                    expert_normalized_tensor.unsqueeze(1),
+                    torch.as_tensor(normalized_sigma, device=device),
+                    args.max_noise_std,
+                    args.prior_penalty,
+                )
+                init_action = torch.cat([
+                    info["action"], expert_normalized_tensor.unsqueeze(1)
+                ], dim=1)
+
                 scorer.reset_reliability()
-                result = solver(info)
+                result = solver(info, init_action=init_action)
                 expanded = {key: value.unsqueeze(1) for key, value in info.items()}
                 frontier_sequence = cost_model.prepare_candidates(
                     expanded, result["actions"].to(device).unsqueeze(1)
@@ -333,13 +361,21 @@ def main():
                     high,
                 ).astype(np.float32)
 
-                random_raw = rng.uniform(
-                    low, high, size=(frameskip, *low.shape)
+                expert_noise = rng.normal(0.0, raw_sigma, size=expert_raw.shape)
+                expert_noise = np.clip(
+                    expert_noise,
+                    -args.max_noise_std * raw_sigma,
+                    args.max_noise_std * raw_sigma,
+                )
+                expert_noise_raw = np.clip(
+                    expert_raw + expert_noise, low, high
                 ).astype(np.float32)
-                random_normalized = ((random_raw - mean) / std).reshape(-1)
+                expert_noise_normalized = (
+                    (expert_noise_raw - mean) / std
+                ).reshape(-1)
                 scorer.reset_reliability()
-                random_predicted, random_next = evaluate_sequence(
-                    info, random_normalized
+                expert_noise_predicted, expert_noise_next = evaluate_sequence(
+                    info, expert_noise_normalized
                 )
 
                 state = np.asarray(data["state"][row], dtype=np.float64)
@@ -353,11 +389,11 @@ def main():
                         frontier_next,
                     ),
                     (
-                        "random",
-                        random_raw,
-                        random_normalized,
-                        random_predicted,
-                        random_next,
+                        "expert_noise",
+                        expert_noise_raw,
+                        expert_noise_normalized,
+                        expert_noise_predicted,
+                        expert_noise_next,
                     ),
                 )
                 for method, raw_block, normalized_block, predicted, predicted_next in candidates:
@@ -374,6 +410,10 @@ def main():
                         "episode": episode,
                         "step": step,
                         "method": method,
+                        "expert_similarity": expert_similarity[0].item(),
+                        "action_noise_rms": float(
+                            np.sqrt(np.mean((raw_block - expert_raw) ** 2))
+                        ),
                         "real_novelty": actual["novelty"],
                         "real_ambiguity": actual["local_ambiguity"],
                         "real_effect_consistency": actual["effect_consistency"],
@@ -406,10 +446,10 @@ def main():
         "method_means": frame.groupby("method")[
             ["real_novelty", "real_ambiguity", "prediction_error"]
         ].mean().to_dict(orient="index"),
-        "paired_frontier_minus_random": {
+        "paired_frontier_minus_expert_noise": {
             metric: bootstrap_paired_difference(
                 pivot["frontier"].to_numpy(),
-                pivot["random"].to_numpy(),
+                pivot["expert_noise"].to_numpy(),
                 bootstrap_rng,
                 args.bootstrap_samples,
             )
@@ -417,7 +457,7 @@ def main():
         },
     }
     manifest = {
-        "sampler": "FrontierCostModel + CEMSolver",
+        "sampler": "nearest expert action + Gaussian noise + FrontierCostModel + CEMSolver",
         "distance": "ActionEffectMemory cosine KNN",
         "score": "normalized novelty - beta * normalized ambiguity",
         "bank": str(args.bank.resolve()),
@@ -429,8 +469,14 @@ def main():
             "num_samples": args.num_samples,
             "topk": args.topk,
             "iterations": args.iterations,
-            "var_scale": args.var_scale,
+            "var_scale": float(np.sqrt(np.mean(normalized_sigma ** 2))),
             "horizon_model_steps": 1,
+        },
+        "expert_noise": {
+            "sigma_raw_action": args.noise_sigma,
+            "max_deviation_std": args.max_noise_std,
+            "prior_penalty": args.prior_penalty,
+            "baseline": "nearest expert action plus one Gaussian perturbation",
         },
         "runtime_seconds": time.time() - started,
         "seed": args.seed,
@@ -443,7 +489,7 @@ def main():
         json.dumps(json_ready(manifest), indent=2, ensure_ascii=True),
         encoding="utf-8",
     )
-    log(json.dumps(summary["paired_frontier_minus_random"], indent=2))
+    log(json.dumps(summary["paired_frontier_minus_expert_noise"], indent=2))
 
 
 if __name__ == "__main__":

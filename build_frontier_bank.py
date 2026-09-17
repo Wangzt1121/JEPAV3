@@ -136,7 +136,8 @@ def move_batch(batch, device):
 
 def encode_last_transition(encoder, batch, device):
     batch = move_batch(batch, device)
-    return encoder(batch["pixels"][:, -2:], batch["action"][:, -2:])
+    z, action_emb = encoder(batch["pixels"][:, -2:], batch["action"][:, -2:])
+    return z, action_emb, batch["action"][:, -2]
 
 
 @torch.no_grad()
@@ -221,8 +222,10 @@ def main():
     for batch_index, raw in enumerate(DataLoader(Subset(dataset, train_indices), **loader_kwargs)):
         if args.max_batches and batch_index >= args.max_batches:
             break
-        z, action = encode_last_transition(encoder, raw, device)
-        bank.add(z[:, -2], action[:, -2], z[:, -1] - z[:, -2])
+        z, action, action_block = encode_last_transition(encoder, raw, device)
+        bank.add(
+            z[:, -2], action[:, -2], z[:, -1] - z[:, -2], action_block
+        )
         if batch_index == 0:
             print(f"emb={tuple(z.shape)} act_emb={tuple(action.shape)}")
     if not len(bank):
@@ -239,6 +242,8 @@ def main():
         "action_stats": action_stats,
         "descriptor_type": "action_effect", "bank_size": len(bank),
         "sampling_version": 2,
+        "action_prior_version": 1,
+        "action_block_space": "z-score normalized primitive actions",
         "sampling": (
             "strict episode split; seeded episode-round-robin sampling; "
             "transition starts separated by frameskip within each episode"
@@ -250,7 +255,7 @@ def main():
     for batch_index, raw in enumerate(DataLoader(Subset(dataset, heldout_indices), **loader_kwargs)):
         if args.max_batches and batch_index >= args.max_batches:
             break
-        z, action = encode_last_transition(encoder, raw, device)
+        z, action, _ = encode_last_transition(encoder, raw, device)
         values = bank.query(z[:, -2], action[:, -2], z[:, -1] - z[:, -2])
         novelty.append(values["novelty"].flatten().cpu())
         ambiguity.append(values["local_ambiguity"].flatten().cpu())
